@@ -1,0 +1,1566 @@
+import gc
+import json
+import math
+import os
+import queue
+import subprocess
+import sys
+import threading
+import tkinter as tk
+import traceback
+from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime
+from tkinter import filedialog
+
+import customtkinter as ctk
+import esptool
+import serial
+from serial.tools import list_ports
+
+
+ctk.set_appearance_mode("Dark")
+ctk.set_default_color_theme("blue")
+
+UI_THEME = {
+    "app_bg": "#05070E",
+    "panel_bg": "#121826",
+    "card_bg": "#1A2232",
+    "card_border": "#4A5264",
+    "input_bg": "#0B111D",
+    "input_border": "#3B455B",
+    "input_focus": "#7AA2F7",
+    "text_primary": "#E9EEF8",
+    "console_bg": "#060A12",
+    "console_text": "#D9DEE8",
+    "button_refresh": "#2C364B",
+    "button_refresh_hover": "#3C4760",
+    "gradient_start": "#5A5A5A",
+    "gradient_end": "#0A0A0A",
+}
+
+
+DEFAULT_SCRIPT = """import time
+import serial
+
+# Variables provided by the app:
+# COM_PORT / SELECTED_COM: selected COM port string
+# ROBOT_IP: IP address from connection settings
+
+print(f"Using COM port: {COM_PORT}")
+print(f"Using robot IP: {ROBOT_IP}")
+
+# Example: your robot control logic
+for i in range(3):
+    print(f"Heartbeat #{i + 1}")
+    time.sleep(0.2)
+
+print("Script completed.")
+"""
+
+BOARD_PROFILES = [
+    {
+        "label": "Авто (любая плата)",
+        "keywords": [],
+        "vid_pid": [],
+    },
+    {
+        "label": "Arduino Uno",
+        "keywords": ["uno", "arduino uno"],
+        "vid_pid": [(0x2341, 0x0043), (0x2A03, 0x0043)],
+    },
+    {
+        "label": "Arduino Nano",
+        "keywords": ["nano", "ch340", "wchusb"],
+        "vid_pid": [(0x2341, 0x0015), (0x0403, 0x6001), (0x1A86, 0x7523)],
+    },
+    {
+        "label": "Arduino Mega 2560",
+        "keywords": ["mega", "mega 2560", "arduino mega"],
+        "vid_pid": [(0x2341, 0x0010), (0x2A03, 0x0010)],
+    },
+    {
+        "label": "ESP32 DevKit",
+        "keywords": ["esp32", "silicon labs", "cp210", "ch340"],
+        "vid_pid": [(0x10C4, 0xEA60), (0x1A86, 0x7523)],
+    },
+    {
+        "label": "ESP8266 (NodeMCU/Wemos)",
+        "keywords": ["esp8266", "nodemcu", "wemos", "cp210", "ch340"],
+        "vid_pid": [(0x10C4, 0xEA60), (0x1A86, 0x7523)],
+    },
+]
+
+
+class RobotControlApp(ctk.CTk):
+    def __init__(self) -> None:
+        super().__init__()
+
+        self.title("IDE")
+        self.geometry("1280x760")
+        self.minsize(1040, 640)
+        self.configure(fg_color=UI_THEME["app_bg"])
+        self._gradient_image = None
+        self._gradient_size = (0, 0)
+        self._active_tab_gradient_image = None
+        self._gradient_angle = -135.0
+        self.gradient_bg_label = ctk.CTkLabel(self, text="")
+        self.gradient_bg_label.place(relx=0, rely=0, relwidth=1, relheight=1)
+        self.gradient_bg_label.lower()
+
+        self.grid_columnconfigure(0, weight=3, uniform="layout")
+        self.grid_columnconfigure(1, weight=7, uniform="layout")
+        self.grid_rowconfigure(0, weight=1)
+        self.port_display_to_device = {}
+        self.port_display_to_info = {}
+        self.tracked_serial_connections = set()
+        self.tracked_board_objects = set()
+        self.script_thread = None
+        self.device_task_thread = None
+        self.stop_event = threading.Event()
+        self.gui_queue = queue.Queue()
+        self.selected_port = ""
+        self.board_profiles = {item["label"]: item for item in BOARD_PROFILES}
+        self.desktop_dir = os.path.join(os.path.expanduser("~"), "Desktop")
+        self.projects_root_dir = ""
+        self.project_aliases = {}
+        self.project_file_buttons = {}
+        self.selected_project_file = ""
+        self.cmd_current_dir = self.desktop_dir
+        self.cmd_thread = None
+        self.bt_status_var = ctk.StringVar(value="Bluetooth: не проверено")
+
+        self._build_tabs()
+        self._build_left_panel()
+        self._build_right_panel()
+        self._build_projects_tab()
+        self._build_cmd_tab()
+
+        self.refresh_ports()
+        self._initialize_default_projects_folder()
+        self.bind("<Configure>", self._handle_gradient_resize)
+        self.after(80, self._refresh_gradient_background)
+        self.log_to_console("IDE запущено.")
+        self.after(100, self._process_gui_queue)
+
+    @staticmethod
+    def _hex_to_rgb(hex_color: str) -> tuple[int, int, int]:
+        color = hex_color.lstrip("#")
+        return tuple(int(color[i : i + 2], 16) for i in (0, 2, 4))
+
+    @staticmethod
+    def _rgb_to_hex(rgb_color: tuple[int, int, int]) -> str:
+        return "#{:02x}{:02x}{:02x}".format(*rgb_color)
+
+    def _create_diagonal_gradient(
+        self, width: int, height: int, angle_deg: float, step: int = 2
+    ) -> tk.PhotoImage:
+        start = self._hex_to_rgb(UI_THEME["gradient_start"])
+        end = self._hex_to_rgb(UI_THEME["gradient_end"])
+        image = tk.PhotoImage(width=width, height=height)
+        angle_rad = math.radians(angle_deg)
+        direction_x = math.cos(angle_rad)
+        direction_y = math.sin(angle_rad)
+
+        corners = [
+            0 * direction_x + 0 * direction_y,
+            (width - 1) * direction_x + 0 * direction_y,
+            0 * direction_x + (height - 1) * direction_y,
+            (width - 1) * direction_x + (height - 1) * direction_y,
+        ]
+        min_projection = min(corners)
+        max_projection = max(corners)
+        denominator = max(max_projection - min_projection, 1e-9)
+
+        step = max(1, int(step))
+        for y in range(0, height, step):
+            for x in range(0, width, step):
+                projection = x * direction_x + y * direction_y
+                ratio = (projection - min_projection) / denominator
+                color = (
+                    int(start[0] + (end[0] - start[0]) * ratio),
+                    int(start[1] + (end[1] - start[1]) * ratio),
+                    int(start[2] + (end[2] - start[2]) * ratio),
+                )
+                image.put(
+                    self._rgb_to_hex(color),
+                    to=(x, y, min(x + step, width), min(y + step, height)),
+                )
+        return image
+
+    def _refresh_gradient_background(self, force: bool = False) -> None:
+        width = max(self.winfo_width(), 2)
+        height = max(self.winfo_height(), 2)
+        if self._gradient_size == (width, height) and not force:
+            return
+        self._gradient_image = self._create_diagonal_gradient(
+            width, height, self._gradient_angle, step=3
+        )
+        self._gradient_size = (width, height)
+        self.gradient_bg_label.configure(image=self._gradient_image)
+        self._update_active_tab_gradient_layer()
+        self.tabview.lift()
+
+    def _handle_gradient_resize(self, _event=None) -> None:
+        self.after(30, self._refresh_gradient_background)
+
+    def _update_active_tab_gradient_layer(self) -> None:
+        current_tab_name = self.tabview.get()
+        if current_tab_name == "IDE":
+            target_tab = self.ide_tab
+            target_label = self.ide_tab_bg_label
+        elif current_tab_name == "Проекты":
+            target_tab = self.projects_tab
+            target_label = self.projects_tab_bg_label
+        else:
+            target_tab = self.cmd_tab
+            target_label = self.cmd_tab_bg_label
+
+        width = max(target_tab.winfo_width(), 2)
+        height = max(target_tab.winfo_height(), 2)
+        self._active_tab_gradient_image = self._create_diagonal_gradient(
+            width, height, self._gradient_angle, step=4
+        )
+        target_label.configure(image=self._active_tab_gradient_image)
+
+    def _animate_gradient_background(self) -> None:
+        self._gradient_angle = (self._gradient_angle + 4.0) % 360
+        self._update_active_tab_gradient_layer()
+        self.after(16, self._animate_gradient_background)
+
+    def _build_tabs(self) -> None:
+        self.tabview = ctk.CTkTabview(
+            self,
+            corner_radius=14,
+            fg_color="#070A12",
+            bg_color="#070A12",
+            segmented_button_selected_color="#2563EB",
+            segmented_button_selected_hover_color="#1D4ED8",
+            segmented_button_unselected_color="#334155",
+            segmented_button_unselected_hover_color="#475569",
+            text_color=UI_THEME["text_primary"],
+        )
+        self.tabview.grid(row=0, column=0, columnspan=2, sticky="nsew", padx=12, pady=12)
+        self.tabview.add("IDE")
+        self.tabview.add("Проекты")
+        self.tabview.add("CMD")
+        self.ide_tab = self.tabview.tab("IDE")
+        self.projects_tab = self.tabview.tab("Проекты")
+        self.cmd_tab = self.tabview.tab("CMD")
+        self.ide_tab.configure(fg_color="transparent", bg_color="transparent")
+        self.projects_tab.configure(fg_color="transparent", bg_color="transparent")
+        self.cmd_tab.configure(fg_color="transparent", bg_color="transparent")
+
+        self.ide_tab_bg_label = ctk.CTkLabel(self.ide_tab, text="")
+        self.ide_tab_bg_label.place(relx=0, rely=0, relwidth=1, relheight=1)
+        self.ide_tab_bg_label.lower()
+
+        self.projects_tab_bg_label = ctk.CTkLabel(self.projects_tab, text="")
+        self.projects_tab_bg_label.place(relx=0, rely=0, relwidth=1, relheight=1)
+        self.projects_tab_bg_label.lower()
+
+        self.cmd_tab_bg_label = ctk.CTkLabel(self.cmd_tab, text="")
+        self.cmd_tab_bg_label.place(relx=0, rely=0, relwidth=1, relheight=1)
+        self.cmd_tab_bg_label.lower()
+        self.ide_tab.grid_columnconfigure(0, weight=3, uniform="layout")
+        self.ide_tab.grid_columnconfigure(1, weight=7, uniform="layout")
+        self.ide_tab.grid_rowconfigure(0, weight=1)
+
+    def _build_left_panel(self) -> None:
+        self.left_panel = ctk.CTkFrame(
+            self.ide_tab,
+            corner_radius=16,
+            fg_color="transparent",
+            bg_color="transparent",
+            border_width=1,
+            border_color=UI_THEME["card_border"],
+        )
+        self.left_panel.grid(row=0, column=0, sticky="nsew", padx=(16, 8), pady=16)
+        self.left_panel.grid_columnconfigure(0, weight=1)
+        self.left_panel.grid_rowconfigure(1, weight=1)
+
+        self.connection_frame = ctk.CTkFrame(
+            self.left_panel,
+            corner_radius=14,
+            fg_color="transparent",
+            bg_color="transparent",
+            border_width=1,
+            border_color=UI_THEME["card_border"],
+        )
+        self.connection_frame.grid(row=0, column=0, sticky="new", padx=12, pady=(12, 8))
+        self.connection_frame.grid_columnconfigure(0, weight=1)
+        self.connection_frame.grid_columnconfigure(1, weight=0)
+
+        conn_label = ctk.CTkLabel(
+            self.connection_frame,
+            text="Connection Settings",
+            text_color=UI_THEME["text_primary"],
+            font=ctk.CTkFont(size=18, weight="bold"),
+        )
+        conn_label.grid(row=0, column=0, columnspan=2, sticky="w", padx=12, pady=(10, 12))
+
+        com_label = ctk.CTkLabel(
+            self.connection_frame, text="COM Port", text_color=UI_THEME["text_primary"]
+        )
+        com_label.grid(row=3, column=0, columnspan=2, sticky="w", padx=12, pady=(0, 4))
+
+        board_label = ctk.CTkLabel(
+            self.connection_frame, text="Плата", text_color=UI_THEME["text_primary"]
+        )
+        board_label.grid(row=1, column=0, columnspan=2, sticky="w", padx=12, pady=(0, 4))
+
+        default_board = BOARD_PROFILES[0]["label"]
+        self.board_var = ctk.StringVar(value=default_board)
+        self.board_menu = ctk.CTkOptionMenu(
+            self.connection_frame,
+            values=list(self.board_profiles.keys()),
+            variable=self.board_var,
+            dynamic_resizing=False,
+            command=lambda _value: self.refresh_ports(),
+            corner_radius=10,
+            height=34,
+            fg_color=UI_THEME["input_bg"],
+            button_color=UI_THEME["button_refresh"],
+            button_hover_color=UI_THEME["button_refresh_hover"],
+            dropdown_fg_color=UI_THEME["card_bg"],
+            dropdown_hover_color=UI_THEME["button_refresh"],
+            text_color=UI_THEME["text_primary"],
+        )
+        self.board_menu.grid(row=2, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 12))
+
+        self.com_var = ctk.StringVar(value="No ports")
+        self.com_menu = ctk.CTkOptionMenu(
+            self.connection_frame,
+            values=["No ports"],
+            variable=self.com_var,
+            dynamic_resizing=False,
+            corner_radius=10,
+            height=34,
+            fg_color=UI_THEME["input_bg"],
+            button_color=UI_THEME["button_refresh"],
+            button_hover_color=UI_THEME["button_refresh_hover"],
+            dropdown_fg_color=UI_THEME["card_bg"],
+            dropdown_hover_color=UI_THEME["button_refresh"],
+            text_color=UI_THEME["text_primary"],
+        )
+        self.com_menu.grid(row=4, column=0, sticky="ew", padx=(12, 6), pady=(0, 12))
+
+        self.refresh_button = ctk.CTkButton(
+            self.connection_frame,
+            text="🔄",
+            width=40,
+            command=self.refresh_ports,
+            corner_radius=10,
+            height=34,
+            fg_color=UI_THEME["button_refresh"],
+            hover_color=UI_THEME["button_refresh_hover"],
+        )
+        self.refresh_button.grid(row=4, column=1, sticky="e", padx=(0, 12), pady=(0, 12))
+
+        ip_label = ctk.CTkLabel(
+            self.connection_frame, text="IP Address", text_color=UI_THEME["text_primary"]
+        )
+        ip_label.grid(row=5, column=0, columnspan=2, sticky="w", padx=12, pady=(0, 4))
+
+        self.ip_entry = ctk.CTkEntry(
+            self.connection_frame,
+            placeholder_text="192.168.0.10",
+            corner_radius=10,
+            height=34,
+            fg_color=UI_THEME["input_bg"],
+            border_color=UI_THEME["input_border"],
+            text_color=UI_THEME["text_primary"],
+        )
+        self.ip_entry.insert(0, "192.168.0.10")
+        self.ip_entry.grid(row=6, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 10))
+
+        port_label = ctk.CTkLabel(
+            self.connection_frame, text="Port", text_color=UI_THEME["text_primary"]
+        )
+        port_label.grid(row=7, column=0, columnspan=2, sticky="w", padx=12, pady=(0, 4))
+
+        self.port_entry = ctk.CTkEntry(
+            self.connection_frame,
+            placeholder_text="5000",
+            corner_radius=10,
+            height=34,
+            fg_color=UI_THEME["input_bg"],
+            border_color=UI_THEME["input_border"],
+            text_color=UI_THEME["text_primary"],
+        )
+        self.port_entry.insert(0, "5000")
+        self.port_entry.grid(row=8, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 12))
+
+        self.bt_only_var = ctk.BooleanVar(value=False)
+        bt_only_switch = ctk.CTkSwitch(
+            self.connection_frame,
+            text="Только Bluetooth COM",
+            variable=self.bt_only_var,
+            command=self.refresh_ports,
+            text_color=UI_THEME["text_primary"],
+            progress_color="#2563EB",
+        )
+        bt_only_switch.grid(row=9, column=0, columnspan=2, sticky="w", padx=12, pady=(0, 8))
+
+        bt_status_label = ctk.CTkLabel(
+            self.connection_frame,
+            textvariable=self.bt_status_var,
+            text_color=UI_THEME["text_primary"],
+            anchor="w",
+        )
+        bt_status_label.grid(row=10, column=0, sticky="ew", padx=(12, 6), pady=(0, 10))
+
+        self.bt_check_button = ctk.CTkButton(
+            self.connection_frame,
+            text="Проверить BT",
+            width=110,
+            height=32,
+            corner_radius=10,
+            fg_color="#0EA5E9",
+            hover_color="#0284C7",
+            command=self.check_bluetooth_connection,
+        )
+        self.bt_check_button.grid(row=10, column=1, sticky="e", padx=(0, 12), pady=(0, 10))
+
+        self.console_frame = ctk.CTkFrame(
+            self.left_panel,
+            corner_radius=14,
+            fg_color="transparent",
+            bg_color="transparent",
+            border_width=1,
+            border_color=UI_THEME["card_border"],
+        )
+        self.console_frame.grid(row=1, column=0, sticky="nsew", padx=12, pady=(8, 12))
+        self.console_frame.grid_columnconfigure(0, weight=1)
+        self.console_frame.grid_rowconfigure(1, weight=1)
+
+        console_label = ctk.CTkLabel(
+            self.console_frame,
+            text="System Output",
+            text_color=UI_THEME["text_primary"],
+            font=ctk.CTkFont(size=18, weight="bold"),
+        )
+        console_label.grid(row=0, column=0, sticky="w", padx=12, pady=(10, 8))
+
+        self.console_text = ctk.CTkTextbox(
+            self.console_frame,
+            corner_radius=10,
+            fg_color=UI_THEME["console_bg"],
+            text_color=UI_THEME["console_text"],
+            font=ctk.CTkFont(family="Consolas", size=12),
+            wrap="word",
+            border_width=1,
+            border_color=UI_THEME["card_border"],
+        )
+        self.console_text.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 8))
+        self.console_text.configure(state="disabled")
+
+        clear_button = ctk.CTkButton(
+            self.console_frame,
+            text="Clear Console",
+            height=34,
+            corner_radius=10,
+            fg_color="#475569",
+            hover_color="#64748B",
+            command=self.clear_console,
+        )
+        clear_button.grid(row=2, column=0, sticky="e", padx=12, pady=(0, 10))
+
+    def _build_right_panel(self) -> None:
+        self.right_panel = ctk.CTkFrame(
+            self.ide_tab,
+            corner_radius=16,
+            fg_color="transparent",
+            bg_color="transparent",
+            border_width=1,
+            border_color=UI_THEME["card_border"],
+        )
+        self.right_panel.grid(row=0, column=1, sticky="nsew", padx=(8, 16), pady=16)
+        self.right_panel.grid_columnconfigure(0, weight=1)
+        self.right_panel.grid_rowconfigure(0, weight=1)
+
+        self.editor_frame = ctk.CTkFrame(
+            self.right_panel,
+            corner_radius=14,
+            fg_color="transparent",
+            bg_color="transparent",
+            border_width=1,
+            border_color=UI_THEME["card_border"],
+        )
+        self.editor_frame.grid(row=0, column=0, sticky="nsew", padx=12, pady=(12, 8))
+        self.editor_frame.grid_columnconfigure(0, weight=1)
+        self.editor_frame.grid_rowconfigure(1, weight=1)
+
+        editor_label = ctk.CTkLabel(
+            self.editor_frame,
+            text="Скрипт редактор",
+            text_color=UI_THEME["text_primary"],
+            font=ctk.CTkFont(size=18, weight="bold"),
+        )
+        editor_label.grid(row=0, column=0, sticky="w", padx=12, pady=(10, 8))
+
+        self.editor_text = ctk.CTkTextbox(
+            self.editor_frame,
+            corner_radius=10,
+            fg_color=UI_THEME["input_bg"],
+            text_color=UI_THEME["text_primary"],
+            font=ctk.CTkFont(family="Consolas", size=13),
+            wrap="none",
+            border_width=1,
+            border_color=UI_THEME["card_border"],
+        )
+        self.editor_text.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
+        self.editor_text.insert("1.0", DEFAULT_SCRIPT)
+
+        actions_frame = ctk.CTkFrame(
+            self.right_panel,
+            corner_radius=14,
+            fg_color="transparent",
+            bg_color="transparent",
+            border_width=1,
+            border_color=UI_THEME["card_border"],
+        )
+        actions_frame.grid(row=1, column=0, sticky="ew", padx=12, pady=(8, 12))
+        actions_frame.grid_columnconfigure((0, 1), weight=1)
+
+        self.run_button = ctk.CTkButton(
+            actions_frame,
+            text="Запустить",
+            height=46,
+            corner_radius=12,
+            fg_color="#1FAA59",
+            hover_color="#168A46",
+            font=ctk.CTkFont(size=14, weight="bold"),
+            command=self.run_script,
+        )
+        self.run_button.grid(row=0, column=0, sticky="ew", padx=(10, 6), pady=10)
+
+        stop_button = ctk.CTkButton(
+            actions_frame,
+            text="Экстренный стоп",
+            height=46,
+            corner_radius=12,
+            fg_color="#C0392B",
+            hover_color="#992D22",
+            font=ctk.CTkFont(size=14, weight="bold"),
+            command=self.emergency_stop,
+        )
+        stop_button.grid(row=0, column=1, sticky="ew", padx=(6, 10), pady=10)
+
+        self.erase_button = ctk.CTkButton(
+            actions_frame,
+            text="Очистить память",
+            height=40,
+            corner_radius=12,
+            fg_color="#3B82F6",
+            hover_color="#2563EB",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            command=self.erase_device_flash,
+        )
+        self.erase_button.grid(row=1, column=0, sticky="ew", padx=(10, 6), pady=(0, 10))
+
+        self.flash_button = ctk.CTkButton(
+            actions_frame,
+            text="Прошить MicroPython",
+            height=40,
+            corner_radius=12,
+            fg_color="#7C3AED",
+            hover_color="#6D28D9",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            command=self._select_and_flash_firmware,
+        )
+        self.flash_button.grid(row=1, column=1, sticky="ew", padx=(6, 10), pady=(0, 10))
+
+    def _build_projects_tab(self) -> None:
+        self.projects_tab.grid_columnconfigure(0, weight=1)
+        self.projects_tab.grid_rowconfigure(1, weight=1)
+
+        top_frame = ctk.CTkFrame(
+            self.projects_tab,
+            corner_radius=14,
+            fg_color="transparent",
+            bg_color="transparent",
+            border_width=1,
+            border_color=UI_THEME["card_border"],
+        )
+        top_frame.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 8))
+        top_frame.grid_columnconfigure(0, weight=1)
+
+        title = ctk.CTkLabel(
+            top_frame,
+            text="Управление проектами",
+            text_color=UI_THEME["text_primary"],
+            font=ctk.CTkFont(size=18, weight="bold"),
+        )
+        title.grid(row=0, column=0, sticky="w", padx=12, pady=(10, 6))
+
+        self.project_folder_entry = ctk.CTkEntry(
+            top_frame,
+            placeholder_text="Название папки проекта на рабочем столе",
+            corner_radius=10,
+            height=34,
+            fg_color=UI_THEME["input_bg"],
+            border_color=UI_THEME["input_border"],
+            text_color=UI_THEME["text_primary"],
+        )
+        self.project_folder_entry.insert(0, "RobotProjects")
+        self.project_folder_entry.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 8))
+
+        folder_buttons = ctk.CTkFrame(top_frame, fg_color="transparent")
+        folder_buttons.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 10))
+        folder_buttons.grid_columnconfigure((0, 1, 2), weight=1)
+
+        create_folder_button = ctk.CTkButton(
+            folder_buttons,
+            text="Создать/Открыть папку",
+            command=self.create_or_open_projects_folder,
+            corner_radius=10,
+            fg_color="#2563EB",
+            hover_color="#1D4ED8",
+        )
+        create_folder_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+
+        refresh_files_button = ctk.CTkButton(
+            folder_buttons,
+            text="Обновить список файлов",
+            command=self.load_project_files,
+            corner_radius=10,
+            fg_color="#334155",
+            hover_color="#475569",
+        )
+        refresh_files_button.grid(row=0, column=1, sticky="ew", padx=6)
+
+        open_in_explorer_button = ctk.CTkButton(
+            folder_buttons,
+            text="Открыть папку в проводнике",
+            command=self.open_projects_folder_in_explorer,
+            corner_radius=10,
+            fg_color="#475569",
+            hover_color="#64748B",
+        )
+        open_in_explorer_button.grid(row=0, column=2, sticky="ew", padx=(6, 0))
+
+        files_card = ctk.CTkFrame(
+            self.projects_tab,
+            corner_radius=14,
+            fg_color="transparent",
+            bg_color="transparent",
+            border_width=1,
+            border_color=UI_THEME["card_border"],
+        )
+        files_card.grid(row=1, column=0, sticky="nsew", padx=12, pady=(8, 12))
+        files_card.grid_columnconfigure(0, weight=1)
+        files_card.grid_rowconfigure(1, weight=1)
+
+        files_title = ctk.CTkLabel(
+            files_card,
+            text="Файлы проекта (.py, .cpp, .c, .cc, .cxx)",
+            text_color=UI_THEME["text_primary"],
+            font=ctk.CTkFont(size=15, weight="bold"),
+        )
+        files_title.grid(row=0, column=0, sticky="w", padx=12, pady=(10, 8))
+
+        self.project_files_frame = ctk.CTkScrollableFrame(
+            files_card,
+            corner_radius=10,
+            fg_color=UI_THEME["input_bg"],
+            border_width=1,
+            border_color=UI_THEME["card_border"],
+        )
+        self.project_files_frame.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 8))
+        self.project_files_frame.grid_columnconfigure(0, weight=1)
+
+        bottom_controls = ctk.CTkFrame(files_card, fg_color="transparent")
+        bottom_controls.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 10))
+        bottom_controls.grid_columnconfigure(0, weight=1)
+
+        self.project_alias_entry = ctk.CTkEntry(
+            bottom_controls,
+            placeholder_text="Новое название файла",
+            corner_radius=10,
+            height=34,
+            fg_color=UI_THEME["input_bg"],
+            border_color=UI_THEME["input_border"],
+            text_color=UI_THEME["text_primary"],
+        )
+        self.project_alias_entry.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+
+        action_buttons = ctk.CTkFrame(bottom_controls, fg_color="transparent")
+        action_buttons.grid(row=1, column=0, sticky="ew")
+        action_buttons.grid_columnconfigure((0, 1), weight=1)
+
+        alias_button = ctk.CTkButton(
+            action_buttons,
+            text="Переименовать файл",
+            command=self.rename_project_button_alias,
+            corner_radius=10,
+            fg_color="#7C3AED",
+            hover_color="#6D28D9",
+        )
+        alias_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+
+        import_button = ctk.CTkButton(
+            action_buttons,
+            text="Загрузить код в основной редактор",
+            command=self.import_selected_project_file_to_editor,
+            corner_radius=10,
+            fg_color="#1FAA59",
+            hover_color="#168A46",
+        )
+        import_button.grid(row=0, column=1, sticky="ew", padx=(6, 0))
+
+    def _initialize_default_projects_folder(self) -> None:
+        self.create_or_open_projects_folder(log=False)
+
+    def _projects_aliases_file_path(self) -> str:
+        if not self.projects_root_dir:
+            return ""
+        return os.path.join(self.projects_root_dir, ".project_aliases.json")
+
+    def _load_project_aliases(self) -> None:
+        self.project_aliases = {}
+        aliases_path = self._projects_aliases_file_path()
+        if not aliases_path or not os.path.exists(aliases_path):
+            return
+        try:
+            with open(aliases_path, "r", encoding="utf-8") as aliases_file:
+                loaded = json.load(aliases_file)
+            if isinstance(loaded, dict):
+                self.project_aliases = {str(k): str(v) for k, v in loaded.items()}
+        except Exception:
+            self.project_aliases = {}
+
+    def _save_project_aliases(self) -> None:
+        aliases_path = self._projects_aliases_file_path()
+        if not aliases_path:
+            return
+        try:
+            with open(aliases_path, "w", encoding="utf-8") as aliases_file:
+                json.dump(self.project_aliases, aliases_file, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            self.log_to_console(f"Не удалось сохранить псевдонимы файлов: {exc}")
+
+    def _clear_project_file_buttons(self) -> None:
+        for widget in self.project_files_frame.winfo_children():
+            widget.destroy()
+        self.project_file_buttons = {}
+
+    def create_or_open_projects_folder(self, log: bool = True) -> None:
+        folder_name = self.project_folder_entry.get().strip() if self.project_folder_entry else ""
+        if not folder_name:
+            folder_name = "RobotProjects"
+            self.project_folder_entry.delete(0, "end")
+            self.project_folder_entry.insert(0, folder_name)
+        self.projects_root_dir = os.path.join(self.desktop_dir, folder_name)
+        try:
+            os.makedirs(self.projects_root_dir, exist_ok=True)
+            self._load_project_aliases()
+            self.load_project_files(log=False)
+            if log:
+                self.log_to_console(
+                    f"Папка проектов готова: {self.projects_root_dir}. "
+                    "Скопируйте туда .py/.cpp файлы."
+                )
+        except Exception as exc:
+            self.log_to_console(f"ОШИБКА создания папки проектов: {exc}")
+
+    def open_projects_folder_in_explorer(self) -> None:
+        if not self.projects_root_dir or not os.path.exists(self.projects_root_dir):
+            self.create_or_open_projects_folder(log=False)
+        try:
+            os.startfile(self.projects_root_dir)
+        except Exception as exc:
+            self.log_to_console(f"Не удалось открыть папку проектов: {exc}")
+
+    def load_project_files(self, log: bool = True) -> None:
+        if not self.projects_root_dir:
+            self.create_or_open_projects_folder(log=False)
+        if not self.projects_root_dir or not os.path.exists(self.projects_root_dir):
+            return
+
+        allowed_extensions = {".py", ".cpp", ".c", ".cc", ".cxx"}
+        project_files = []
+        for file_name in sorted(os.listdir(self.projects_root_dir)):
+            full_path = os.path.join(self.projects_root_dir, file_name)
+            _, ext = os.path.splitext(file_name.lower())
+            if os.path.isfile(full_path) and ext in allowed_extensions:
+                project_files.append(full_path)
+
+        self._clear_project_file_buttons()
+        self.selected_project_file = ""
+
+        if not project_files:
+            empty_label = ctk.CTkLabel(
+                self.project_files_frame,
+                text="Файлы не найдены. Добавьте .py или .cpp в папку проекта.",
+                text_color=UI_THEME["text_primary"],
+                anchor="w",
+            )
+            empty_label.grid(row=0, column=0, sticky="ew", padx=8, pady=8)
+            if log:
+                self.log_to_console("В папке проектов пока нет файлов кода.")
+            return
+
+        for index, file_path in enumerate(project_files):
+            file_name = os.path.basename(file_path)
+            alias = self.project_aliases.get(file_name, file_name)
+            file_button = ctk.CTkButton(
+                self.project_files_frame,
+                text=alias,
+                anchor="w",
+                command=lambda path=file_path: self.select_project_file(path),
+                corner_radius=10,
+                fg_color="#334155",
+                hover_color="#475569",
+            )
+            file_button.grid(row=index, column=0, sticky="ew", padx=8, pady=4)
+            self.project_file_buttons[file_path] = file_button
+
+        if log:
+            self.log_to_console(f"Загружено файлов проекта: {len(project_files)}")
+
+    def select_project_file(self, file_path: str) -> None:
+        self.selected_project_file = file_path
+        for path, button in self.project_file_buttons.items():
+            if path == file_path:
+                button.configure(fg_color="#2563EB")
+            else:
+                button.configure(fg_color="#334155")
+        selected_name = os.path.basename(file_path)
+        self.project_alias_entry.delete(0, "end")
+        self.project_alias_entry.insert(0, self.project_aliases.get(selected_name, selected_name))
+        self.log_to_console(f"Выбран проектный файл: {selected_name}")
+
+    def rename_project_button_alias(self) -> None:
+        if not self.selected_project_file:
+            self.log_to_console("Сначала выберите файл проекта.")
+            return
+        new_alias = self.project_alias_entry.get().strip()
+        if not new_alias:
+            self.log_to_console("Введите новое название файла.")
+            return
+        file_name = os.path.basename(self.selected_project_file)
+        self.project_aliases[file_name] = new_alias
+        self._save_project_aliases()
+        selected_button = self.project_file_buttons.get(self.selected_project_file)
+        if selected_button:
+            selected_button.configure(text=new_alias)
+        self.log_to_console(
+            f"Кнопка файла '{file_name}' переименована в '{new_alias}'"
+        )
+
+    def import_selected_project_file_to_editor(self) -> None:
+        if not self.selected_project_file:
+            self.log_to_console("Сначала выберите файл проекта.")
+            return
+        try:
+            with open(self.selected_project_file, "r", encoding="utf-8") as code_file:
+                code_text = code_file.read()
+        except UnicodeDecodeError:
+            self.log_to_console("Файл не в UTF-8. Сохраните файл в UTF-8 и повторите.")
+            return
+        except Exception as exc:
+            self.log_to_console(f"Не удалось прочитать файл: {exc}")
+            return
+
+        self.editor_text.delete("1.0", "end")
+        self.editor_text.insert("1.0", code_text)
+        self.tabview.set("IDE")
+        self.log_to_console(
+            f"Код из '{os.path.basename(self.selected_project_file)}' загружен в основной редактор."
+        )
+
+    def _build_cmd_tab(self) -> None:
+        self.cmd_tab.grid_columnconfigure(0, weight=1)
+        self.cmd_tab.grid_rowconfigure(1, weight=1)
+
+        cmd_top = ctk.CTkFrame(
+            self.cmd_tab,
+            corner_radius=14,
+            fg_color="transparent",
+            bg_color="transparent",
+            border_width=1,
+            border_color=UI_THEME["card_border"],
+        )
+        cmd_top.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 8))
+        cmd_top.grid_columnconfigure(0, weight=1)
+
+        cmd_title = ctk.CTkLabel(
+            cmd_top,
+            text="CMD (Windows Command Prompt)",
+            text_color=UI_THEME["text_primary"],
+            font=ctk.CTkFont(size=18, weight="bold"),
+        )
+        cmd_title.grid(row=0, column=0, sticky="w", padx=12, pady=(10, 4))
+
+        self.cmd_dir_label = ctk.CTkLabel(
+            cmd_top,
+            text=f"Текущая папка: {self.cmd_current_dir}",
+            text_color=UI_THEME["text_primary"],
+            anchor="w",
+        )
+        self.cmd_dir_label.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 8))
+
+        toolbar = ctk.CTkFrame(cmd_top, fg_color="transparent")
+        toolbar.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 10))
+        toolbar.grid_columnconfigure((0, 1), weight=1)
+
+        self.cmd_run_button = ctk.CTkButton(
+            toolbar,
+            text="Выполнить",
+            corner_radius=10,
+            fg_color="#2563EB",
+            hover_color="#1D4ED8",
+            command=self.run_cmd_command,
+        )
+        self.cmd_run_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+
+        open_external_cmd_button = ctk.CTkButton(
+            toolbar,
+            text="Открыть отдельную CMD",
+            corner_radius=10,
+            fg_color="#334155",
+            hover_color="#475569",
+            command=self.open_external_cmd_window,
+        )
+        open_external_cmd_button.grid(row=0, column=1, sticky="ew", padx=(6, 0))
+
+        cmd_body = ctk.CTkFrame(
+            self.cmd_tab,
+            corner_radius=14,
+            fg_color="transparent",
+            bg_color="transparent",
+            border_width=1,
+            border_color=UI_THEME["card_border"],
+        )
+        cmd_body.grid(row=1, column=0, sticky="nsew", padx=12, pady=(8, 12))
+        cmd_body.grid_columnconfigure(0, weight=1)
+        cmd_body.grid_rowconfigure(0, weight=1)
+
+        self.cmd_output = ctk.CTkTextbox(
+            cmd_body,
+            corner_radius=10,
+            fg_color=UI_THEME["console_bg"],
+            text_color=UI_THEME["console_text"],
+            font=ctk.CTkFont(family="Consolas", size=12),
+            border_width=1,
+            border_color=UI_THEME["card_border"],
+            wrap="word",
+        )
+        self.cmd_output.grid(row=0, column=0, sticky="nsew", padx=12, pady=(12, 8))
+        self.cmd_output.configure(state="disabled")
+
+        self.cmd_entry = ctk.CTkEntry(
+            cmd_body,
+            placeholder_text="Введите команду CMD, например: dir",
+            corner_radius=10,
+            height=34,
+            fg_color=UI_THEME["input_bg"],
+            border_color=UI_THEME["input_border"],
+            text_color=UI_THEME["text_primary"],
+        )
+        self.cmd_entry.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 12))
+        self.cmd_entry.bind("<Return>", lambda _event: self.run_cmd_command())
+
+        self._append_cmd_output("CMD вкладка готова. Введите команду и нажмите Enter.")
+
+    def _append_cmd_output(self, text: str) -> None:
+        self.cmd_output.configure(state="normal")
+        self.cmd_output.insert("end", f"{text}\n")
+        self.cmd_output.see("end")
+        self.cmd_output.configure(state="disabled")
+
+    def _queue_cmd_output(self, text: str) -> None:
+        self.gui_queue.put(("cmd_output", text))
+
+    def _update_cmd_dir_label(self) -> None:
+        self.cmd_dir_label.configure(text=f"Текущая папка: {self.cmd_current_dir}")
+
+    def open_external_cmd_window(self) -> None:
+        try:
+            subprocess.Popen(["cmd.exe"], cwd=self.cmd_current_dir)
+        except Exception as exc:
+            self._append_cmd_output(f"Ошибка запуска отдельной CMD: {exc}")
+
+    def run_cmd_command(self) -> None:
+        if self.cmd_thread and self.cmd_thread.is_alive():
+            self._append_cmd_output("Подождите завершения предыдущей команды...")
+            return
+
+        command_text = self.cmd_entry.get().strip()
+        if not command_text:
+            self._append_cmd_output("Введите команду.")
+            return
+
+        self.cmd_entry.delete(0, "end")
+        self._append_cmd_output(f"{self.cmd_current_dir}> {command_text}")
+        self.cmd_run_button.configure(state="disabled")
+        self.cmd_thread = threading.Thread(
+            target=self._run_cmd_worker,
+            args=(command_text,),
+            daemon=True,
+        )
+        self.cmd_thread.start()
+
+    def _run_cmd_worker(self, command_text: str) -> None:
+        if command_text.lower().startswith("cd"):
+            self._handle_cmd_cd(command_text)
+            self.gui_queue.put(("cmd_done", None))
+            return
+
+        try:
+            result = subprocess.run(
+                ["cmd.exe", "/c", command_text],
+                cwd=self.cmd_current_dir,
+                capture_output=True,
+                text=True,
+                encoding="cp866",
+                errors="replace",
+            )
+            stdout_text = (result.stdout or "").strip()
+            stderr_text = (result.stderr or "").strip()
+            if stdout_text:
+                for line in stdout_text.splitlines():
+                    self._queue_cmd_output(line)
+            if stderr_text:
+                for line in stderr_text.splitlines():
+                    self._queue_cmd_output(line)
+            self._queue_cmd_output(f"[exit code: {result.returncode}]")
+        except Exception as exc:
+            self._queue_cmd_output(f"Ошибка выполнения команды: {exc}")
+        finally:
+            self.gui_queue.put(("cmd_done", None))
+
+    def _handle_cmd_cd(self, command_text: str) -> None:
+        raw_target = command_text[2:].strip()
+        if not raw_target:
+            self._queue_cmd_output(self.cmd_current_dir)
+            return
+
+        target = raw_target.strip('"')
+        if target == ".":
+            self._queue_cmd_output(self.cmd_current_dir)
+            return
+        if target == "..":
+            candidate = os.path.dirname(self.cmd_current_dir)
+        elif os.path.isabs(target):
+            candidate = target
+        else:
+            candidate = os.path.normpath(os.path.join(self.cmd_current_dir, target))
+
+        if os.path.isdir(candidate):
+            self.cmd_current_dir = candidate
+            self._queue_cmd_output(f"Текущая папка изменена: {self.cmd_current_dir}")
+            self.gui_queue.put(("log", f"CMD: рабочая папка изменена на {self.cmd_current_dir}"))
+        else:
+            self._queue_cmd_output(f"Системе не удается найти указанный путь: {candidate}")
+        self.gui_queue.put(("cmd_output", "__UPDATE_DIR_LABEL__"))
+
+    def _timestamp(self) -> str:
+        return datetime.now().strftime("%H:%M:%S")
+
+    def log_to_console(self, message: str) -> None:
+        self.console_text.configure(state="normal")
+        self.console_text.insert("end", f"[{self._timestamp()}] {message}\n")
+        self.console_text.see("end")
+        self.console_text.configure(state="disabled")
+
+    def _queue_log(self, message: str) -> None:
+        self.gui_queue.put(("log", message))
+
+    def _process_gui_queue(self) -> None:
+        while True:
+            try:
+                event_type, payload = self.gui_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            if event_type == "log":
+                self.log_to_console(payload)
+            elif event_type == "cmd_output":
+                if payload == "__UPDATE_DIR_LABEL__":
+                    self._update_cmd_dir_label()
+                else:
+                    self._append_cmd_output(payload)
+            elif event_type == "cmd_done":
+                self._on_cmd_done()
+            elif event_type == "script_done":
+                self._on_script_finished()
+            elif event_type == "device_task_done":
+                self._on_device_task_finished()
+
+        self.after(100, self._process_gui_queue)
+
+    def _on_script_finished(self) -> None:
+        self._set_action_buttons_state("normal")
+        self.script_thread = None
+        self.stop_event.clear()
+        self.tracked_board_objects.clear()
+        self.tracked_serial_connections.clear()
+
+    def _on_device_task_finished(self) -> None:
+        self._set_action_buttons_state("normal")
+        self.device_task_thread = None
+
+    def _on_cmd_done(self) -> None:
+        self.cmd_thread = None
+        self.cmd_run_button.configure(state="normal")
+
+    def _set_action_buttons_state(self, state: str) -> None:
+        self.run_button.configure(state=state)
+        self.erase_button.configure(state=state)
+        self.flash_button.configure(state=state)
+
+    def clear_console(self) -> None:
+        self.console_text.configure(state="normal")
+        self.console_text.delete("1.0", "end")
+        self.console_text.configure(state="disabled")
+        self.log_to_console("Console cleared.")
+
+    def _selected_com_port_name(self) -> str:
+        selected_display = self.com_var.get().strip()
+        mapped_value = self.port_display_to_device.get(selected_display)
+        if mapped_value:
+            return mapped_value
+        return selected_display.split(" ", 1)[0] if selected_display else ""
+
+    def _sync_selected_port(self) -> str:
+        self.selected_port = self._selected_com_port_name()
+        return self.selected_port
+
+    def _selected_board_profile(self) -> dict:
+        return self.board_profiles.get(self.board_var.get(), BOARD_PROFILES[0])
+
+    def _port_matches_selected_board(self, port_info) -> bool:
+        profile = self._selected_board_profile()
+        if not profile["keywords"] and not profile["vid_pid"]:
+            return True
+
+        port_vid = getattr(port_info, "vid", None)
+        port_pid = getattr(port_info, "pid", None)
+        if port_vid is not None and port_pid is not None:
+            if (port_vid, port_pid) in profile["vid_pid"]:
+                return True
+
+        searchable_text = " ".join(
+            [
+                str(getattr(port_info, "description", "") or ""),
+                str(getattr(port_info, "manufacturer", "") or ""),
+                str(getattr(port_info, "product", "") or ""),
+                str(getattr(port_info, "hwid", "") or ""),
+            ]
+        ).lower()
+        return any(keyword in searchable_text for keyword in profile["keywords"])
+
+    def _detect_board_label_for_port(self, port_info) -> str:
+        searchable_text = " ".join(
+            [
+                str(getattr(port_info, "description", "") or ""),
+                str(getattr(port_info, "manufacturer", "") or ""),
+                str(getattr(port_info, "product", "") or ""),
+                str(getattr(port_info, "hwid", "") or ""),
+            ]
+        ).lower()
+        port_vid = getattr(port_info, "vid", None)
+        port_pid = getattr(port_info, "pid", None)
+
+        for profile in BOARD_PROFILES[1:]:
+            if port_vid is not None and port_pid is not None:
+                if (port_vid, port_pid) in profile["vid_pid"]:
+                    return profile["label"]
+            if any(keyword in searchable_text for keyword in profile["keywords"]):
+                return profile["label"]
+
+        return "Не определена"
+
+    @staticmethod
+    def _is_bluetooth_port(port_info) -> bool:
+        searchable_text = " ".join(
+            [
+                str(getattr(port_info, "description", "") or ""),
+                str(getattr(port_info, "manufacturer", "") or ""),
+                str(getattr(port_info, "product", "") or ""),
+                str(getattr(port_info, "hwid", "") or ""),
+            ]
+        ).lower()
+        bt_keywords = ("bluetooth", "bth", "rfcomm", "wireless")
+        return any(keyword in searchable_text for keyword in bt_keywords)
+
+    def check_bluetooth_connection(self) -> None:
+        if not self._validate_selected_port():
+            return
+        selected_display = self.com_var.get().strip()
+        port_info = self.port_display_to_info.get(selected_display)
+        if port_info and not self._is_bluetooth_port(port_info):
+            self.bt_status_var.set("Bluetooth: выбранный порт не похож на BT")
+            self.log_to_console("Выбранный порт не определяется как Bluetooth COM.")
+            return
+        self._test_serial_port_for_bt(self.selected_port)
+
+    def _test_serial_port_for_bt(self, port_name: str) -> None:
+        self.bt_check_button.configure(state="disabled")
+        self.bt_status_var.set(f"Bluetooth: проверка {port_name}...")
+        try:
+            with serial.Serial(port=port_name, baudrate=9600, timeout=1):
+                pass
+            self.bt_status_var.set(f"Bluetooth: подключено ({port_name})")
+            self.log_to_console(f"Bluetooth COM-порт доступен: {port_name}")
+        except Exception as exc:
+            self.bt_status_var.set(f"Bluetooth: нет связи ({port_name})")
+            self.log_to_console(f"Bluetooth проверка не прошла для {port_name}: {exc}")
+        finally:
+            self.bt_check_button.configure(state="normal")
+
+    def _validate_selected_port(self) -> bool:
+        selected_display = self.com_var.get().strip()
+        self._sync_selected_port()
+        if not self.selected_port or selected_display.startswith("Порты не найдены"):
+            self.log_to_console("ОШИБКА: Выберите корректный COM-порт перед запуском!")
+            return False
+        return True
+
+    def _is_any_task_running(self) -> bool:
+        script_running = self.script_thread and self.script_thread.is_alive()
+        device_running = self.device_task_thread and self.device_task_thread.is_alive()
+        return bool(script_running or device_running)
+
+    def refresh_ports(self) -> None:
+        detected_ports = list(list_ports.comports())
+        self.port_display_to_device = {}
+        self.port_display_to_info = {}
+        port_labels = []
+        selected_board = self._selected_board_profile()["label"]
+        bluetooth_only = bool(self.bt_only_var.get()) if hasattr(self, "bt_only_var") else False
+
+        for port_info in detected_ports:
+            if bluetooth_only and not self._is_bluetooth_port(port_info):
+                continue
+            if not self._port_matches_selected_board(port_info):
+                continue
+            short_name = (port_info.device or "").strip()
+            description = (port_info.description or "").strip()
+            board_name = self._detect_board_label_for_port(port_info)
+            if description and description != "n/a":
+                display_name = f"{short_name} - {description} [{board_name}]"
+            else:
+                display_name = f"{short_name} [{board_name}]"
+            if display_name:
+                self.port_display_to_device[display_name] = short_name
+                self.port_display_to_info[display_name] = port_info
+                port_labels.append(display_name)
+
+        if port_labels:
+            self.com_menu.configure(values=port_labels)
+            self.com_var.set(port_labels[0])
+            self._sync_selected_port()
+            self.log_to_console(f"Обнаружены COM-порты: {', '.join(port_labels)}")
+            if bluetooth_only:
+                self.bt_status_var.set("Bluetooth: выберите порт и нажмите Проверить BT")
+        else:
+            not_found_label = f"Порты не найдены ({selected_board})"
+            self.com_menu.configure(values=[not_found_label])
+            self.com_var.set(not_found_label)
+            self.selected_port = ""
+            self.log_to_console(
+                f"COM-порты не найдены для выбранной платы: {selected_board}."
+            )
+            if bluetooth_only:
+                self.bt_status_var.set("Bluetooth: BT COM-порты не найдены")
+
+    def run_script(self) -> None:
+        if self._is_any_task_running():
+            if self.stop_event.is_set():
+                self.log_to_console("Ожидание полной остановки текущего скрипта...")
+            else:
+                self.log_to_console("Операция уже выполняется.")
+            return
+
+        script = self.editor_text.get("1.0", "end-1c")
+        if not self._validate_selected_port():
+            return
+
+        com_port = self.selected_port
+        robot_ip = self.ip_entry.get().strip()
+        robot_port = self.port_entry.get().strip()
+
+        self.log_to_console(f"--- Попытка запуска на {com_port} ---")
+        self._set_action_buttons_state("disabled")
+        self.stop_event.clear()
+
+        self.script_thread = threading.Thread(
+            target=self._execute_script_thread,
+            args=(script, com_port, robot_ip, robot_port),
+            daemon=True,
+        )
+        self.script_thread.start()
+
+    def _execute_script_thread(
+        self,
+        script: str,
+        com_port: str,
+        robot_ip: str,
+        robot_port: str,
+    ) -> None:
+        class ScriptStopRequested(Exception):
+            pass
+
+        class QueueWriter:
+            def __init__(self, logger_callback):
+                self.logger_callback = logger_callback
+                self.buffer = ""
+
+            def write(self, text):
+                if not text:
+                    return
+                self.buffer += text
+                while "\n" in self.buffer:
+                    line, self.buffer = self.buffer.split("\n", 1)
+                    if line.strip():
+                        self.logger_callback(line)
+
+            def flush(self):
+                if self.buffer.strip():
+                    self.logger_callback(self.buffer)
+                self.buffer = ""
+
+        def thread_trace(frame, event, arg):
+            if self.stop_event.is_set():
+                raise ScriptStopRequested("STOP requested by user")
+            return thread_trace
+
+        # Ensure the latest UI values are always injected into exec globals.
+        execution_globals = {
+            "__builtins__": __builtins__,
+            "serial": serial,
+            "COM_PORT": com_port,
+            "SELECTED_COM": com_port,
+            "ROBOT_IP": robot_ip,
+            "ROBOT_PORT": robot_port,
+            "STOP_EVENT": self.stop_event,
+        }
+
+        writer = QueueWriter(self._queue_log)
+        self._queue_log("RUN SCRIPT started.")
+        original_serial_class = serial.Serial
+
+        app_self = self
+
+        class TrackedSerial(original_serial_class):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                app_self.tracked_serial_connections.add(self)
+
+        try:
+            serial.Serial = TrackedSerial
+            sys.settrace(thread_trace)
+            with redirect_stdout(writer), redirect_stderr(writer):
+                exec(script, execution_globals)
+        except ScriptStopRequested:
+            writer.flush()
+            self._queue_log("Скрипт остановлен пользователем.")
+        except Exception:
+            error_text = traceback.format_exc()
+            writer.flush()
+            self._queue_log("Execution failed with traceback:")
+            for line in error_text.rstrip().splitlines():
+                self._queue_log(line)
+        finally:
+            sys.settrace(None)
+            self._track_board_like_objects(execution_globals)
+            serial.Serial = original_serial_class
+            writer.flush()
+            self._queue_log("RUN SCRIPT finished.")
+            self.gui_queue.put(("script_done", None))
+
+    def erase_device_flash(self) -> None:
+        if self._is_any_task_running():
+            self.log_to_console("Операция уже выполняется.")
+            return
+        if not self._validate_selected_port():
+            return
+
+        self._set_action_buttons_state("disabled")
+        self.log_to_console(f"--- Очистка памяти ESP32 на {self.selected_port} ---")
+        self.device_task_thread = threading.Thread(
+            target=self._erase_flash_worker,
+            daemon=True,
+        )
+        self.device_task_thread.start()
+
+    def _erase_flash_worker(self) -> None:
+        writer = self._build_queue_writer()
+        try:
+            with redirect_stdout(writer), redirect_stderr(writer):
+                esptool.main(["--chip", "esp32", "--port", self.selected_port, "erase_flash"])
+            writer.flush()
+            self._queue_log("Очистка памяти завершена.")
+        except SystemExit as exc:
+            writer.flush()
+            self._queue_log(f"esptool завершен с кодом: {exc}")
+        except Exception as exc:
+            writer.flush()
+            self._queue_log(f"ОШИБКА erase_flash: {exc}")
+            self._queue_log("Проверьте порт, кабель и режим загрузчика ESP32.")
+        finally:
+            self.gui_queue.put(("device_task_done", None))
+
+    def flash_device_firmware(self, firmware_path: str) -> None:
+        if self._is_any_task_running():
+            self.log_to_console("Операция уже выполняется.")
+            return
+        if not self._validate_selected_port():
+            return
+        if not firmware_path:
+            self.log_to_console("ОШИБКА: Не выбран файл прошивки .bin")
+            return
+
+        self._set_action_buttons_state("disabled")
+        self.log_to_console(f"--- Прошивка ESP32 на {self.selected_port} ---")
+        self.log_to_console(f"Файл: {firmware_path}")
+        self.device_task_thread = threading.Thread(
+            target=self._flash_firmware_worker,
+            args=(firmware_path,),
+            daemon=True,
+        )
+        self.device_task_thread.start()
+
+    def _flash_firmware_worker(self, firmware_path: str) -> None:
+        writer = self._build_queue_writer()
+        try:
+            with redirect_stdout(writer), redirect_stderr(writer):
+                esptool.main(
+                    [
+                        "--chip",
+                        "esp32",
+                        "--port",
+                        self.selected_port,
+                        "--baud",
+                        "460800",
+                        "write_flash",
+                        "--flash_mode",
+                        "dio",
+                        "0x1000",
+                        firmware_path,
+                    ]
+                )
+            writer.flush()
+            self._queue_log("Прошивка завершена.")
+        except SystemExit as exc:
+            writer.flush()
+            self._queue_log(f"esptool завершен с кодом: {exc}")
+        except Exception as exc:
+            writer.flush()
+            self._queue_log(f"ОШИБКА прошивки: {exc}")
+            self._queue_log("Проверьте, что порт свободен и ESP32 в bootloader mode.")
+        finally:
+            self.gui_queue.put(("device_task_done", None))
+
+    def _select_and_flash_firmware(self) -> None:
+        firmware_path = filedialog.askopenfilename(
+            title="Выберите .bin файл прошивки",
+            filetypes=[("BIN files", "*.bin"), ("All files", "*.*")],
+        )
+        if firmware_path:
+            self.flash_device_firmware(firmware_path)
+        else:
+            self.log_to_console("Выбор файла прошивки отменен.")
+
+    def _build_queue_writer(self):
+        class QueueWriter:
+            def __init__(self, logger_callback):
+                self.logger_callback = logger_callback
+                self.buffer = ""
+
+            def write(self, text):
+                if not text:
+                    return
+                self.buffer += text
+                while "\n" in self.buffer:
+                    line, self.buffer = self.buffer.split("\n", 1)
+                    if line.strip():
+                        self.logger_callback(line)
+
+            def flush(self):
+                if self.buffer.strip():
+                    self.logger_callback(self.buffer.strip())
+                self.buffer = ""
+
+        return QueueWriter(self._queue_log)
+
+    def _track_board_like_objects(self, namespace: dict) -> None:
+        for value in namespace.values():
+            if self._is_board_like_object(value):
+                self.tracked_board_objects.add(value)
+
+    @staticmethod
+    def _is_board_like_object(obj) -> bool:
+        if obj is None:
+            return False
+        return hasattr(obj, "exit") and hasattr(obj, "sp")
+
+    def _close_board_like_objects(self) -> int:
+        closed_boards = 0
+
+        for board in list(self.tracked_board_objects):
+            try:
+                board.exit()
+                closed_boards += 1
+            except Exception:
+                continue
+
+        # Fallback: scan GC for board-like objects that were not tracked.
+        try:
+            for obj in gc.get_objects():
+                if self._is_board_like_object(obj):
+                    try:
+                        obj.exit()
+                        closed_boards += 1
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+        self.tracked_board_objects.clear()
+        return closed_boards
+
+    def emergency_stop(self) -> None:
+        self.log_to_console("STOP COMMAND SENT")
+        self.stop_event.set()
+        # Keep action buttons in stable state while stop cleanup is in progress.
+        closed_boards = self._close_board_like_objects()
+        closed_connections = 0
+
+        for connection in list(self.tracked_serial_connections):
+            try:
+                if getattr(connection, "is_open", False):
+                    connection.close()
+                    closed_connections += 1
+            except Exception:
+                continue
+
+        self.tracked_serial_connections.clear()
+
+        try:
+            for obj in gc.get_objects():
+                if isinstance(obj, serial.Serial):
+                    try:
+                        if getattr(obj, "is_open", False):
+                            obj.close()
+                            closed_connections += 1
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+        self.log_to_console(f"Закрыто board-соединений: {closed_boards}")
+        self.log_to_console(f"Закрыто serial-соединений: {closed_connections}")
+        if self.script_thread and self.script_thread.is_alive():
+            self.log_to_console("Ожидание остановки скрипта после закрытия соединений...")
+        else:
+            self.script_thread = None
+            self.stop_event.clear()
+            self._set_action_buttons_state("normal")
+
+
+if __name__ == "__main__":
+    app = RobotControlApp()
+    app.mainloop()
