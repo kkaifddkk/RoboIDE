@@ -3,9 +3,12 @@ import json
 import math
 import os
 import queue
+import re
+import shutil
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 import traceback
 from contextlib import redirect_stderr, redirect_stdout
@@ -70,8 +73,11 @@ BOARD_PROFILES = [
     },
     {
         "label": "Arduino Nano",
-        "keywords": ["nano", "ch340", "wchusb"],
-        "vid_pid": [(0x2341, 0x0015), (0x0403, 0x6001), (0x1A86, 0x7523)],
+        # ch340/wchusb is a generic USB-UART bridge used by many Arduino clones,
+        # not a reliable Nano identifier.
+        "keywords": ["nano", "arduino nano"],
+        # Only keep Nano-specific IDs here. USB-UART bridges (CH340/FTDI) are not board IDs.
+        "vid_pid": [(0x2341, 0x0015)],
     },
     {
         "label": "Arduino Mega 2560",
@@ -81,12 +87,14 @@ BOARD_PROFILES = [
     {
         "label": "ESP32 DevKit",
         "keywords": ["esp32", "silicon labs", "cp210", "ch340"],
-        "vid_pid": [(0x10C4, 0xEA60), (0x1A86, 0x7523)],
+        # CH340 is a generic bridge; not a reliable ESP32 identifier.
+        "vid_pid": [(0x10C4, 0xEA60)],
     },
     {
         "label": "ESP8266 (NodeMCU/Wemos)",
         "keywords": ["esp8266", "nodemcu", "wemos", "cp210", "ch340"],
-        "vid_pid": [(0x10C4, 0xEA60), (0x1A86, 0x7523)],
+        # CH340 is a generic bridge; not a reliable ESP8266 identifier.
+        "vid_pid": [(0x10C4, 0xEA60)],
     },
 ]
 
@@ -103,6 +111,7 @@ class RobotControlApp(ctk.CTk):
         self._gradient_size = (0, 0)
         self._active_tab_gradient_image = None
         self._gradient_angle = -135.0
+        self._gradient_resize_job = None
         self.gradient_bg_label = ctk.CTkLabel(self, text="")
         self.gradient_bg_label.place(relx=0, rely=0, relwidth=1, relheight=1)
         self.gradient_bg_label.lower()
@@ -122,6 +131,7 @@ class RobotControlApp(ctk.CTk):
         self.board_profiles = {item["label"]: item for item in BOARD_PROFILES}
         self.desktop_dir = os.path.join(os.path.expanduser("~"), "Desktop")
         self.projects_root_dir = ""
+        self.projects_current_dir = ""
         self.project_aliases = {}
         self.project_file_buttons = {}
         self.selected_project_file = ""
@@ -134,6 +144,7 @@ class RobotControlApp(ctk.CTk):
         self._build_right_panel()
         self._build_projects_tab()
         self._build_cmd_tab()
+        self._bind_layout_independent_shortcuts()
 
         self.refresh_ports()
         self._initialize_default_projects_folder()
@@ -141,6 +152,54 @@ class RobotControlApp(ctk.CTk):
         self.after(80, self._refresh_gradient_background)
         self.log_to_console("IDE запущено.")
         self.after(100, self._process_gui_queue)
+
+    def _bind_layout_independent_shortcuts(self) -> None:
+        # Tk recognizes Ctrl+Latin shortcuts by keysym. On non-English layouts
+        # (e.g. Cyrillic) we additionally map by physical keycode.
+        targets = [
+            getattr(self, "editor_text", None),
+            getattr(self, "cmd_output", None),
+            getattr(self, "cmd_entry", None),
+        ]
+
+        def _resolve_widget(w):
+            if w is None:
+                return None
+            return getattr(w, "_textbox", w)
+
+        def _on_ctrl_key(event):
+            # Windows virtual keycodes for A/C/V/X/Z/Y.
+            code = int(getattr(event, "keycode", 0))
+            widget = event.widget
+            try:
+                if code == 65:  # A
+                    widget.tag_add("sel", "1.0", "end-1c")
+                    widget.mark_set("insert", "end-1c")
+                    widget.see("insert")
+                    return "break"
+                if code == 67:  # C
+                    widget.event_generate("<<Copy>>")
+                    return "break"
+                if code == 86:  # V
+                    widget.event_generate("<<Paste>>")
+                    return "break"
+                if code == 88:  # X
+                    widget.event_generate("<<Cut>>")
+                    return "break"
+                if code == 90:  # Z
+                    widget.event_generate("<<Undo>>")
+                    return "break"
+                if code == 89:  # Y
+                    widget.event_generate("<<Redo>>")
+                    return "break"
+            except Exception:
+                return None
+            return None
+
+        for target in targets:
+            tw = _resolve_widget(target)
+            if tw is not None:
+                tw.bind("<Control-KeyPress>", _on_ctrl_key, add="+")
 
     @staticmethod
     def _hex_to_rgb(hex_color: str) -> tuple[int, int, int]:
@@ -192,8 +251,11 @@ class RobotControlApp(ctk.CTk):
         height = max(self.winfo_height(), 2)
         if self._gradient_size == (width, height) and not force:
             return
+        max_dim = max(width, height)
+        # Adaptive quality: large windows get bigger step to avoid UI freezes.
+        step = 3 if max_dim <= 900 else 5 if max_dim <= 1400 else 7
         self._gradient_image = self._create_diagonal_gradient(
-            width, height, self._gradient_angle, step=3
+            width, height, self._gradient_angle, step=step
         )
         self._gradient_size = (width, height)
         self.gradient_bg_label.configure(image=self._gradient_image)
@@ -201,7 +263,13 @@ class RobotControlApp(ctk.CTk):
         self.tabview.lift()
 
     def _handle_gradient_resize(self, _event=None) -> None:
-        self.after(30, self._refresh_gradient_background)
+        # Debounce resize events (fullscreen/maximize triggers many Configure events).
+        try:
+            if self._gradient_resize_job is not None:
+                self.after_cancel(self._gradient_resize_job)
+        except Exception:
+            pass
+        self._gradient_resize_job = self.after(140, self._refresh_gradient_background)
 
     def _update_active_tab_gradient_layer(self) -> None:
         current_tab_name = self.tabview.get()
@@ -217,8 +285,10 @@ class RobotControlApp(ctk.CTk):
 
         width = max(target_tab.winfo_width(), 2)
         height = max(target_tab.winfo_height(), 2)
+        max_dim = max(width, height)
+        step = 4 if max_dim <= 900 else 6 if max_dim <= 1400 else 8
         self._active_tab_gradient_image = self._create_diagonal_gradient(
-            width, height, self._gradient_angle, step=4
+            width, height, self._gradient_angle, step=step
         )
         target_label.configure(image=self._active_tab_gradient_image)
 
@@ -595,29 +665,29 @@ class RobotControlApp(ctk.CTk):
 
         self.project_folder_entry = ctk.CTkEntry(
             top_frame,
-            placeholder_text="Название папки проекта на рабочем столе",
+            placeholder_text="Путь к корневой папке проектов (можно вставить вручную)",
             corner_radius=10,
             height=34,
             fg_color=UI_THEME["input_bg"],
             border_color=UI_THEME["input_border"],
             text_color=UI_THEME["text_primary"],
         )
-        self.project_folder_entry.insert(0, "RobotProjects")
+        self.project_folder_entry.insert(0, os.path.join(self.desktop_dir, "RobotProjects"))
         self.project_folder_entry.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 8))
 
         folder_buttons = ctk.CTkFrame(top_frame, fg_color="transparent")
         folder_buttons.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 10))
-        folder_buttons.grid_columnconfigure((0, 1, 2), weight=1)
+        folder_buttons.grid_columnconfigure((0, 1, 2, 3), weight=1)
 
-        create_folder_button = ctk.CTkButton(
+        choose_root_button = ctk.CTkButton(
             folder_buttons,
-            text="Создать/Открыть папку",
-            command=self.create_or_open_projects_folder,
+            text="Выбрать корень…",
+            command=self.choose_projects_root_folder,
             corner_radius=10,
             fg_color="#2563EB",
             hover_color="#1D4ED8",
         )
-        create_folder_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        choose_root_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
 
         refresh_files_button = ctk.CTkButton(
             folder_buttons,
@@ -639,6 +709,17 @@ class RobotControlApp(ctk.CTk):
         )
         open_in_explorer_button.grid(row=0, column=2, sticky="ew", padx=(6, 0))
 
+        self.projects_back_button = ctk.CTkButton(
+            folder_buttons,
+            text="Назад",
+            command=self.go_back_projects_folder,
+            corner_radius=10,
+            fg_color="#334155",
+            hover_color="#475569",
+        )
+        self.projects_back_button.grid(row=0, column=3, sticky="ew", padx=(6, 0))
+        self.projects_back_button.grid_remove()
+
         files_card = ctk.CTkFrame(
             self.projects_tab,
             corner_radius=14,
@@ -649,15 +730,24 @@ class RobotControlApp(ctk.CTk):
         )
         files_card.grid(row=1, column=0, sticky="nsew", padx=12, pady=(8, 12))
         files_card.grid_columnconfigure(0, weight=1)
+        files_card.grid_columnconfigure(1, weight=0)
         files_card.grid_rowconfigure(1, weight=1)
 
         files_title = ctk.CTkLabel(
             files_card,
-            text="Файлы проекта (.py, .cpp, .c, .cc, .cxx)",
+            text="Файлы проекта (.py, .ino, .cpp, .c, .cc, .cxx) и папки",
             text_color=UI_THEME["text_primary"],
             font=ctk.CTkFont(size=15, weight="bold"),
         )
         files_title.grid(row=0, column=0, sticky="w", padx=12, pady=(10, 8))
+
+        self.projects_path_label = ctk.CTkLabel(
+            files_card,
+            text="Папка: (не выбрана)",
+            text_color=UI_THEME["text_primary"],
+            anchor="w",
+        )
+        self.projects_path_label.grid(row=0, column=1, sticky="e", padx=12, pady=(10, 8))
 
         self.project_files_frame = ctk.CTkScrollableFrame(
             files_card,
@@ -709,7 +799,7 @@ class RobotControlApp(ctk.CTk):
         import_button.grid(row=0, column=1, sticky="ew", padx=(6, 0))
 
     def _initialize_default_projects_folder(self) -> None:
-        self.create_or_open_projects_folder(log=False)
+        self._apply_projects_root_from_entry(log=False)
 
     def _projects_aliases_file_path(self) -> str:
         if not self.projects_root_dir:
@@ -725,7 +815,13 @@ class RobotControlApp(ctk.CTk):
             with open(aliases_path, "r", encoding="utf-8") as aliases_file:
                 loaded = json.load(aliases_file)
             if isinstance(loaded, dict):
-                self.project_aliases = {str(k): str(v) for k, v in loaded.items()}
+                # Keys are stored as relative paths from projects_root_dir (posix-style).
+                # Backward-compatible: older versions stored only basenames.
+                normalized: dict[str, str] = {}
+                for k, v in loaded.items():
+                    key = str(k).replace("\\", "/")
+                    normalized[key] = str(v)
+                self.project_aliases = normalized
         except Exception:
             self.project_aliases = {}
 
@@ -744,54 +840,98 @@ class RobotControlApp(ctk.CTk):
             widget.destroy()
         self.project_file_buttons = {}
 
-    def create_or_open_projects_folder(self, log: bool = True) -> None:
-        folder_name = self.project_folder_entry.get().strip() if self.project_folder_entry else ""
-        if not folder_name:
-            folder_name = "RobotProjects"
-            self.project_folder_entry.delete(0, "end")
-            self.project_folder_entry.insert(0, folder_name)
-        self.projects_root_dir = os.path.join(self.desktop_dir, folder_name)
-        try:
-            os.makedirs(self.projects_root_dir, exist_ok=True)
-            self._load_project_aliases()
-            self.load_project_files(log=False)
+    def _apply_projects_root_from_entry(self, log: bool = True) -> None:
+        if not self.project_folder_entry:
+            return
+        root_path = self.project_folder_entry.get().strip()
+        if not root_path:
+            return
+        root_path = os.path.abspath(os.path.expanduser(root_path))
+        if not os.path.isdir(root_path):
             if log:
                 self.log_to_console(
-                    f"Папка проектов готова: {self.projects_root_dir}. "
-                    "Скопируйте туда .py/.cpp файлы."
+                    "Папка проектов не найдена. Укажите существующую папку (путь до папки проекта)"
                 )
-        except Exception as exc:
-            self.log_to_console(f"ОШИБКА создания папки проектов: {exc}")
+            self.projects_root_dir = root_path
+            self.projects_current_dir = root_path
+            self.load_project_files(log=False)
+            return
+
+        self.projects_root_dir = root_path
+        if not self.projects_current_dir or not os.path.isdir(self.projects_current_dir):
+            self.projects_current_dir = self.projects_root_dir
+        if not os.path.abspath(self.projects_current_dir).startswith(os.path.abspath(self.projects_root_dir) + os.sep) and os.path.abspath(self.projects_current_dir) != os.path.abspath(self.projects_root_dir):
+            self.projects_current_dir = self.projects_root_dir
+
+        self._load_project_aliases()
+        self.load_project_files(log=False)
+        if log:
+            self.log_to_console(f"Корень проектов: {self.projects_root_dir}")
+
+    def choose_projects_root_folder(self) -> None:
+        initial_dir = self.projects_root_dir or self.desktop_dir
+        chosen = filedialog.askdirectory(title="Выберите корневую папку проектов", initialdir=initial_dir)
+        if not chosen:
+            return
+        self.project_folder_entry.delete(0, "end")
+        self.project_folder_entry.insert(0, chosen)
+        self._apply_projects_root_from_entry(log=True)
 
     def open_projects_folder_in_explorer(self) -> None:
         if not self.projects_root_dir or not os.path.exists(self.projects_root_dir):
-            self.create_or_open_projects_folder(log=False)
+            self._apply_projects_root_from_entry(log=False)
         try:
-            os.startfile(self.projects_root_dir)
+            target_dir = self.projects_current_dir or self.projects_root_dir
+            os.startfile(target_dir)
         except Exception as exc:
             self.log_to_console(f"Не удалось открыть папку проектов: {exc}")
 
     def load_project_files(self, log: bool = True) -> None:
         if not self.projects_root_dir:
-            self.create_or_open_projects_folder(log=False)
+            self._apply_projects_root_from_entry(log=False)
         if not self.projects_root_dir or not os.path.exists(self.projects_root_dir):
             return
+        if not self.projects_current_dir:
+            self.projects_current_dir = self.projects_root_dir
+        if not os.path.exists(self.projects_current_dir):
+            self.projects_current_dir = self.projects_root_dir
 
-        allowed_extensions = {".py", ".cpp", ".c", ".cc", ".cxx"}
-        project_files = []
-        for file_name in sorted(os.listdir(self.projects_root_dir)):
-            full_path = os.path.join(self.projects_root_dir, file_name)
-            _, ext = os.path.splitext(file_name.lower())
+        allowed_extensions = {".py", ".ino", ".cpp", ".c", ".cc", ".cxx"}
+        project_dirs: list[str] = []
+        project_files: list[str] = []
+        for name in sorted(os.listdir(self.projects_current_dir)):
+            full_path = os.path.join(self.projects_current_dir, name)
+            if os.path.isdir(full_path):
+                project_dirs.append(full_path)
+                continue
+            _, ext = os.path.splitext(name.lower())
             if os.path.isfile(full_path) and ext in allowed_extensions:
                 project_files.append(full_path)
 
         self._clear_project_file_buttons()
         self.selected_project_file = ""
+        if hasattr(self, "projects_back_button"):
+            try:
+                root_abs = os.path.abspath(self.projects_root_dir)
+                cur_abs = os.path.abspath(self.projects_current_dir)
+                if cur_abs != root_abs:
+                    self.projects_back_button.grid()
+                else:
+                    self.projects_back_button.grid_remove()
+            except Exception:
+                self.projects_back_button.grid_remove()
+        if hasattr(self, "projects_path_label"):
+            try:
+                rel_dir = os.path.relpath(self.projects_current_dir, self.projects_root_dir)
+            except Exception:
+                rel_dir = "."
+            rel_dir = "." if rel_dir in {".", ""} else rel_dir
+            self.projects_path_label.configure(text=f"Папка: {rel_dir}")
 
-        if not project_files:
+        if not project_files and not project_dirs:
             empty_label = ctk.CTkLabel(
                 self.project_files_frame,
-                text="Файлы не найдены. Добавьте .py или .cpp в папку проекта.",
+                text="Файлы и папки не найдены. Добавьте код или создайте новую папку.",
                 text_color=UI_THEME["text_primary"],
                 anchor="w",
             )
@@ -800,9 +940,25 @@ class RobotControlApp(ctk.CTk):
                 self.log_to_console("В папке проектов пока нет файлов кода.")
             return
 
-        for index, file_path in enumerate(project_files):
+        row = 0
+        for dir_path in project_dirs:
+            dir_name = os.path.basename(dir_path.rstrip("\\/")) + os.sep
+            dir_button = ctk.CTkButton(
+                self.project_files_frame,
+                text=dir_name,
+                anchor="w",
+                command=lambda p=dir_path: self.enter_projects_folder(p),
+                corner_radius=10,
+                fg_color="#0F172A",
+                hover_color="#1F2937",
+            )
+            dir_button.grid(row=row, column=0, sticky="ew", padx=8, pady=4)
+            row += 1
+
+        for file_path in project_files:
+            rel_key = self._project_rel_key(file_path)
             file_name = os.path.basename(file_path)
-            alias = self.project_aliases.get(file_name, file_name)
+            alias = self.project_aliases.get(rel_key, file_name)
             file_button = ctk.CTkButton(
                 self.project_files_frame,
                 text=alias,
@@ -812,11 +968,57 @@ class RobotControlApp(ctk.CTk):
                 fg_color="#334155",
                 hover_color="#475569",
             )
-            file_button.grid(row=index, column=0, sticky="ew", padx=8, pady=4)
+            file_button.grid(row=row, column=0, sticky="ew", padx=8, pady=4)
             self.project_file_buttons[file_path] = file_button
+            row += 1
 
         if log:
-            self.log_to_console(f"Загружено файлов проекта: {len(project_files)}")
+            self.log_to_console(
+                f"Загружено элементов: папок {len(project_dirs)}, файлов {len(project_files)}"
+            )
+
+    def _project_rel_key(self, file_path: str) -> str:
+        try:
+            return os.path.relpath(file_path, self.projects_root_dir).replace("\\", "/")
+        except Exception:
+            return os.path.basename(file_path)
+
+    def enter_projects_folder(self, folder_path: str) -> None:
+        if not self.projects_root_dir:
+            self._apply_projects_root_from_entry(log=False)
+        try:
+            root_abs = os.path.abspath(self.projects_root_dir)
+            target_abs = os.path.abspath(folder_path)
+            if not (target_abs == root_abs or target_abs.startswith(root_abs + os.sep)):
+                self.log_to_console("ОШИБКА: нельзя выходить за пределы корневой папки проектов.")
+                return
+            if not os.path.isdir(target_abs):
+                self.log_to_console("Папка не найдена.")
+                return
+            self.projects_current_dir = target_abs
+            self.load_project_files(log=False)
+            self.log_to_console(f"Открыта папка: {os.path.relpath(target_abs, root_abs)}")
+        except Exception as exc:
+            self.log_to_console(f"Не удалось открыть папку: {exc}")
+
+    def go_back_projects_folder(self) -> None:
+        if not self.projects_root_dir:
+            self._apply_projects_root_from_entry(log=False)
+        if not self.projects_current_dir:
+            self.projects_current_dir = self.projects_root_dir
+        try:
+            root_abs = os.path.abspath(self.projects_root_dir)
+            cur_abs = os.path.abspath(self.projects_current_dir)
+            if cur_abs == root_abs:
+                return
+            parent = os.path.dirname(cur_abs)
+            if not (parent == root_abs or parent.startswith(root_abs + os.sep)):
+                parent = root_abs
+            self.projects_current_dir = parent
+            self.load_project_files(log=False)
+        except Exception as exc:
+            self.log_to_console(f"Не удалось перейти назад: {exc}")
+
 
     def select_project_file(self, file_path: str) -> None:
         self.selected_project_file = file_path
@@ -827,7 +1029,8 @@ class RobotControlApp(ctk.CTk):
                 button.configure(fg_color="#334155")
         selected_name = os.path.basename(file_path)
         self.project_alias_entry.delete(0, "end")
-        self.project_alias_entry.insert(0, self.project_aliases.get(selected_name, selected_name))
+        rel_key = self._project_rel_key(file_path)
+        self.project_alias_entry.insert(0, self.project_aliases.get(rel_key, selected_name))
         self.log_to_console(f"Выбран проектный файл: {selected_name}")
 
     def rename_project_button_alias(self) -> None:
@@ -839,7 +1042,8 @@ class RobotControlApp(ctk.CTk):
             self.log_to_console("Введите новое название файла.")
             return
         file_name = os.path.basename(self.selected_project_file)
-        self.project_aliases[file_name] = new_alias
+        rel_key = self._project_rel_key(self.selected_project_file)
+        self.project_aliases[rel_key] = new_alias
         self._save_project_aliases()
         selected_button = self.project_file_buttons.get(self.selected_project_file)
         if selected_button:
@@ -1137,9 +1341,16 @@ class RobotControlApp(ctk.CTk):
 
         port_vid = getattr(port_info, "vid", None)
         port_pid = getattr(port_info, "pid", None)
+        ch340_vidpid = (0x1A86, 0x7523)
+        ftdi_vidpid = (0x0403, 0x6001)
         if port_vid is not None and port_pid is not None:
             if (port_vid, port_pid) in profile["vid_pid"]:
                 return True
+            # USB-UART bridges (CH340/FTDI) cannot reliably identify a specific board model.
+            # We only treat them as a match for UNO (common UNO clones) to avoid hiding the port.
+            if profile.get("label") == "Arduino Uno":
+                if (port_vid, port_pid) in {ch340_vidpid, ftdi_vidpid}:
+                    return True
 
         searchable_text = " ".join(
             [
@@ -1163,12 +1374,28 @@ class RobotControlApp(ctk.CTk):
         port_vid = getattr(port_info, "vid", None)
         port_pid = getattr(port_info, "pid", None)
 
+        ch340_vidpid = (0x1A86, 0x7523)
+        ftdi_vidpid = (0x0403, 0x6001)
+
+        if "arduino" in searchable_text and "uno" in searchable_text:
+            return "Arduino Uno"
+        if "arduino" in searchable_text and "nano" in searchable_text:
+            return "Arduino Nano"
+        if "arduino" in searchable_text and "mega" in searchable_text:
+            return "Arduino Mega 2560"
+
         for profile in BOARD_PROFILES[1:]:
             if port_vid is not None and port_pid is not None:
                 if (port_vid, port_pid) in profile["vid_pid"]:
                     return profile["label"]
             if any(keyword in searchable_text for keyword in profile["keywords"]):
                 return profile["label"]
+
+        if port_vid is not None and port_pid is not None:
+            if (port_vid, port_pid) == ch340_vidpid:
+                return "Arduino Uno"
+            if (port_vid, port_pid) == ftdi_vidpid:
+                return "Arduino Uno"
 
         return "Не определена"
 
@@ -1231,13 +1458,17 @@ class RobotControlApp(ctk.CTk):
         selected_board = self._selected_board_profile()["label"]
         bluetooth_only = bool(self.bt_only_var.get()) if hasattr(self, "bt_only_var") else False
 
+        def _safe_ui_text(text: str) -> str:
+            # Remove control/unprintable characters that sometimes appear in Windows device strings.
+            return "".join(ch if ch.isprintable() else " " for ch in (text or "")).strip()
+
         for port_info in detected_ports:
             if bluetooth_only and not self._is_bluetooth_port(port_info):
                 continue
             if not self._port_matches_selected_board(port_info):
                 continue
             short_name = (port_info.device or "").strip()
-            description = (port_info.description or "").strip()
+            description = _safe_ui_text((port_info.description or "").strip())
             board_name = self._detect_board_label_for_port(port_info)
             if description and description != "n/a":
                 display_name = f"{short_name} - {description} [{board_name}]"
@@ -1353,6 +1584,159 @@ class RobotControlApp(ctk.CTk):
             serial.Serial = TrackedSerial
             sys.settrace(thread_trace)
             with redirect_stdout(writer), redirect_stderr(writer):
+                def _is_arduino_source(source: str) -> bool:
+                    return bool(re.search(r"\bvoid\s+setup\s*\(\s*\)", source))
+
+                # Arduino emulation / hardware bridge via TrackedSerial.
+                _arduino_serial_holder: dict[str, object] = {"sp": None}
+
+                def _get_arduino_serial():
+                    sp = _arduino_serial_holder.get("sp")
+                    if sp is not None and getattr(sp, "is_open", False):
+                        return sp
+                    # COM_PORT is injected into execution_globals, but inside this closure
+                    # we read it from the injected globals to satisfy type checkers.
+                    port_name = execution_globals.get("COM_PORT") or execution_globals.get("SELECTED_COM")
+                    sp = serial.Serial(port_name, baudrate=115200, timeout=1)
+                    _arduino_serial_holder["sp"] = sp
+                    return sp
+
+                def _send_arduino_command(line: str) -> None:
+                    sp = _get_arduino_serial()
+                    payload = (line.rstrip("\n") + "\n").encode("utf-8", errors="replace")
+                    sp.write(payload)
+                    # Helpful visibility for users running Arduino-like scripts.
+                    writer.write(f"[UART] {line}\n")
+
+                def pinMode(pin, mode):
+                    _send_arduino_command(f"PINMODE {pin} {mode}")
+
+                def digitalWrite(pin, value):
+                    _send_arduino_command(f"DW {pin} {value}")
+
+                def digitalRead(pin):
+                    _send_arduino_command(f"DR {pin}")
+                    sp = _get_arduino_serial()
+                    try:
+                        resp = sp.readline().decode("utf-8", errors="replace").strip()
+                        return int(resp) if resp else 0
+                    except Exception:
+                        return 0
+
+                def delay(ms):
+                    # Arduino delay is milliseconds.
+                    time.sleep(float(ms) / 1000.0)
+
+                class _SerialEmu:
+                    def println(self, *args, sep=" ", end="\n"):
+                        text = sep.join(str(a) for a in args) + end
+                        writer.write(text)
+
+                # Required globals for Arduino-like scripts.
+                execution_globals.update(
+                    {
+                        "pinMode": pinMode,
+                        "digitalRead": digitalRead,
+                        "digitalWrite": digitalWrite,
+                        "delay": delay,
+                        "Serial": _SerialEmu(),
+                        "INPUT_PULLUP": "INPUT_PULLUP",
+                        "OUTPUT": "OUTPUT",
+                        "HIGH": 1,
+                        "LOW": 0,
+                        "KY031_PIN": 2,
+                        "BUZZER_PIN": 8,
+                    }
+                )
+
+                if _is_arduino_source(script):
+                    selected_label = str(self.board_var.get()) if hasattr(self, "board_var") else ""
+                    fqbn_map = {
+                        "Arduino Uno": "arduino:avr:uno",
+                        "Arduino Nano": "arduino:avr:nano",
+                        "Arduino Mega 2560": "arduino:avr:mega",
+                    }
+                    fqbn = fqbn_map.get(selected_label, "arduino:avr:uno")
+
+                    if not shutil.which("arduino-cli"):
+                        raise RuntimeError(
+                            "Не найден arduino-cli. Установите Arduino CLI и добавьте в PATH, "
+                            "затем повторите. (Например: winget install ArduinoSA.CLI)"
+                        )
+
+                    base_dir = os.path.dirname(os.path.abspath(__file__))
+                    build_cache_dir = os.path.join(base_dir, "build_cache")
+                    os.makedirs(build_cache_dir, exist_ok=True)
+
+                    sketch_name = f"sketch_{int(time.time())}"
+                    sketch_dir = os.path.join(build_cache_dir, sketch_name)
+                    os.makedirs(sketch_dir, exist_ok=True)
+                    sketch_path = os.path.join(sketch_dir, f"{sketch_name}.ino")
+                    with open(sketch_path, "w", encoding="utf-8") as f:
+                        f.write(script.replace("\r\n", "\n").replace("\r", "\n") + "\n")
+
+                    writer.write(f"[ARDUINO] Компиляция: {fqbn}\n")
+                    compile_cmd = ["arduino-cli", "compile", "--fqbn", fqbn, sketch_dir]
+                    writer.write("[ARDUINO] " + " ".join(compile_cmd) + "\n")
+
+                    def _run_cli(cmd: list[str]) -> subprocess.CompletedProcess:
+                        env = os.environ.copy()
+                        # Force UTF-8 output from arduino-cli to avoid mojibake on Windows.
+                        env["LANG"] = "C.UTF-8"
+                        env["LC_ALL"] = "C.UTF-8"
+                        return subprocess.run(
+                            cmd,
+                            capture_output=True,
+                            text=True,
+                            encoding="utf-8",
+                            errors="replace",
+                            env=env,
+                        )
+
+                    compile_res = _run_cli(compile_cmd)
+                    if compile_res.stdout:
+                        writer.write(compile_res.stdout + "\n")
+                    if compile_res.stderr:
+                        for line in compile_res.stderr.rstrip().splitlines():
+                            self._queue_log(line)
+                    if compile_res.returncode != 0:
+                        core_list_res = _run_cli(["arduino-cli", "core", "list"])
+                        core_list_text = f"{core_list_res.stdout}\n{core_list_res.stderr}".lower()
+                        if "arduino:avr" not in core_list_text:
+                            self._queue_log("Платформа arduino:avr не установлена. Устанавливаю автоматически...")
+                            install_cmd = ["arduino-cli", "core", "install", "arduino:avr"]
+                            writer.write("[ARDUINO] " + " ".join(install_cmd) + "\n")
+                            install_res = _run_cli(install_cmd)
+                            if install_res.stdout:
+                                writer.write(install_res.stdout + "\n")
+                            if install_res.stderr:
+                                for line in install_res.stderr.rstrip().splitlines():
+                                    self._queue_log(line)
+                            if install_res.returncode == 0:
+                                self._queue_log("arduino:avr установлен. Повторяю компиляцию...")
+                                compile_res = _run_cli(compile_cmd)
+                                if compile_res.stdout:
+                                    writer.write(compile_res.stdout + "\n")
+                                if compile_res.stderr:
+                                    for line in compile_res.stderr.rstrip().splitlines():
+                                        self._queue_log(line)
+                    if compile_res.returncode != 0:
+                        raise RuntimeError(f"Компиляция не удалась (code={compile_res.returncode}).")
+
+                    writer.write(f"[ARDUINO] Загрузка в {com_port}\n")
+                    upload_cmd = ["arduino-cli", "upload", "-p", com_port, "--fqbn", fqbn, sketch_dir]
+                    writer.write("[ARDUINO] " + " ".join(upload_cmd) + "\n")
+                    upload_res = _run_cli(upload_cmd)
+                    if upload_res.stdout:
+                        writer.write(upload_res.stdout + "\n")
+                    if upload_res.stderr:
+                        for line in upload_res.stderr.rstrip().splitlines():
+                            self._queue_log(line)
+                    if upload_res.returncode != 0:
+                        raise RuntimeError(f"Загрузка не удалась (code={upload_res.returncode}).")
+
+                    writer.write("[ARDUINO] Готово. Скетч запущен на плате.\n")
+                    return
                 exec(script, execution_globals)
         except ScriptStopRequested:
             writer.flush()
